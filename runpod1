@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# deploy.sh - turn web pages into live HLS (.m3u8) streams on a RunPod pod.
+#
+# Each page gets its own virtual display (Xvfb) + Chrome window + FFmpeg
+# encoder. A dedicated nginx serves the output on $PORT:
+#
+#   https://<POD_ID>-<PORT>.proxy.runpod.net/page1/index.m3u8
+#   https://<POD_ID>-<PORT>.proxy.runpod.net/page2/index.m3u8
+#   https://<POD_ID>-<PORT>.proxy.runpod.net/            (preview player)
+#
+# Usage (as root, from a file - not piped):
+#   STREAM_URLS="https://a.com,https://b.com,https://c.com" bash deploy.sh
+#
+# After the first run the script is installed as `streams`:
+#   streams start | stop | restart | status | urls
+#
+# Settings (environment variables; only STREAM_URLS is required):
+#   STREAM_URLS     comma-separated page URLs, one stream per URL
+#   PORT            HTTP port served by nginx (default 8080, expose it in RunPod)
+#   WIDTH, HEIGHT   capture size (default 1280x720)
+#   FPS             frames per second (default 25)
+#   BITRATE         video bitrate in kbps (default 2500)
+#   PRESET          x264 preset (default veryfast; ultrafast if CPU is maxed out)
+#   HLS_TIME        segment length in seconds (default 2)
+#   HLS_LIST_SIZE   segments kept in each playlist (default 6)
+#   PAGE_LOAD_WAIT  seconds to let a page load before capture starts (default 5)
+#
+# Settings are saved to /etc/streams/config, so later `streams` commands reuse
+# them without the environment variables being set again.
+
+set -euo pipefail
+
+SELF=/usr/local/bin/streams
+STATE_DIR=/etc/streams
+CONFIG_FILE=$STATE_DIR/config
+NGINX_CONF=$STATE_DIR/nginx.conf
+HLS_ROOT=/var/www/streams
+DATA_DIR=/var/lib/streams
+RUN_DIR=/var/run/streams
+LOG_DIR=/var/log/streams
+DISPLAY_BASE=99
+CONFIG_VARS=(STREAM_URLS PORT WIDTH HEIGHT FPS BITRATE PRESET HLS_TIME HLS_LIST_SIZE PAGE_LOAD_WAIT POD_ID)
+
+log() { echo "[streams] $*"; }
+die() { echo "[streams] ERROR: $*" >&2; exit 1; }
+
+load_config() {
+  # Values from the environment win; the saved config fills in the rest.
+  if [[ -f $CONFIG_FILE ]]; then
+    local var saved
+    for var in "${CONFIG_VARS[@]}"; do
+      if [[ -z ${!var:-} ]]; then
+        saved=$(source "$CONFIG_FILE"; echo "${!var:-}")
+        [[ -n $saved ]] && printf -v "$var" '%s' "$saved"
+      fi
+    done
+  fi
+  : "${PORT:=8080}" "${WIDTH:=1280}" "${HEIGHT:=720}" "${FPS:=25}" "${BITRATE:=2500}"
+  : "${PRESET:=veryfast}" "${HLS_TIME:=2}" "${HLS_LIST_SIZE:=6}" "${PAGE_LOAD_WAIT:=5}"
+  : "${POD_ID:=${RUNPOD_POD_ID:-}}"
+  STREAM_URLS=${STREAM_URLS:-}
+}
+
+save_config() {
+  mkdir -p "$STATE_DIR"
+  local var
+  for var in "${CONFIG_VARS[@]}"; do
+    printf '%s=%q\n' "$var" "${!var:-}"
+  done > "$CONFIG_FILE"
+}
+
+stream_urls() {
+  # One URL per line, whitespace trimmed, blanks dropped.
+  tr ',' '\n' <<< "$STREAM_URLS" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d'
+}
+
+public_base() {
+  if [[ -n $POD_ID ]]; then
+    echo "https://${POD_ID}-${PORT}.proxy.runpod.net"
+  else
+    echo "http://localhost:${PORT}"
+  fi
+}
+
+install_self() {
+  local src=${BASH_SOURCE[0]}
+  [[ $src == "$SELF" ]] && return
+  [[ -f $src ]] || die "run this script from a file (curl -o /deploy.sh ... && bash /deploy.sh), not piped into bash"
+  install -m 755 "$src" "$SELF"
+}
+
+install_deps() {
+  if command -v google-chrome >/dev/null && command -v ffmpeg >/dev/null \
+    && command -v Xvfb >/dev/null && command -v nginx >/dev/null && command -v xdpyinfo >/dev/null; then
+    log "Dependencies already installed"
+    return
+  fi
+  log "Installing Xvfb, FFmpeg, nginx and Google Chrome (takes a few minutes)..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl wget procps xvfb x11-utils ffmpeg nginx \
+    fonts-liberation fonts-noto-color-emoji
+  # Ubuntu's chromium package is a snap, which doesn't run in containers.
+  wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+  apt-get install -y /tmp/google-chrome.deb
+  rm -f /tmp/google-chrome.deb
+}
+
+write_nginx_conf() {
+  mkdir -p "$STATE_DIR" "$HLS_ROOT" "$RUN_DIR" "$LOG_DIR"
+  # A separate nginx instance, so it never clashes with the template's own nginx.
+  cat > "$NGINX_CONF" <<EOF
+worker_processes auto;
+pid $RUN_DIR/nginx.pid;
+error_log $LOG_DIR/nginx-error.log warn;
+
+events { worker_connections 1024; }
+
+http {
+  include /etc/nginx/mime.types;
+  access_log off;
+  sendfile on;
+  tcp_nopush on;
+
+  server {
+    listen $PORT;
+    root $HLS_ROOT;
+    index index.html;
+
+    location ~ \.m3u8\$ {
+      add_header Access-Control-Allow-Origin * always;
+      add_header Cache-Control "no-cache, no-store" always;
+    }
+    location ~ \.ts\$ {
+      add_header Access-Control-Allow-Origin * always;
+      add_header Cache-Control "max-age=60" always;
+    }
+    location / {
+      add_header Access-Control-Allow-Origin * always;
+    }
+  }
+}
+EOF
+}
+
+start_nginx() {
+  stop_nginx
+  nginx -t -c "$NGINX_CONF" >/dev/null 2>&1 || nginx -t -c "$NGINX_CONF"
+  nginx -c "$NGINX_CONF"
+  log "nginx serving $HLS_ROOT on port $PORT"
+}
+
+stop_nginx() {
+  if [[ -f $RUN_DIR/nginx.pid ]]; then
+    nginx -c "$NGINX_CONF" -s quit 2>/dev/null || kill "$(cat "$RUN_DIR/nginx.pid")" 2>/dev/null || true
+    rm -f "$RUN_DIR/nginx.pid"
+    sleep 1
+  fi
+}
+
+write_index() {
+  local n=0 url items=""
+  while IFS= read -r url; do
+    n=$((n + 1))
+    items+="<section><h2>page$n</h2><p class=\"src\">$url</p>"
+    items+="<p><a href=\"page$n/index.m3u8\">page$n/index.m3u8</a></p>"
+    items+="<video data-src=\"page$n/index.m3u8\" controls muted autoplay playsinline></video></section>"
+  done < <(stream_urls)
+
+  cat > "$HLS_ROOT/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Streams</title>
+<style>
+  body { margin: 0; padding: 16px; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+  main { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  section { background: #1c1c1c; border-radius: 8px; padding: 12px; }
+  h2 { margin: 0 0 4px; font-size: 16px; }
+  .src { margin: 0 0 8px; font-size: 12px; color: #999; word-break: break-all; }
+  a { color: #8ab4ff; }
+  video { width: 100%; background: #000; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>$items</main>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<script>
+  document.querySelectorAll("video[data-src]").forEach(function (video) {
+    var src = video.getAttribute("data-src");
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src;
+    } else if (window.Hls && Hls.isSupported()) {
+      var hls = new Hls({ liveSyncDurationCount: 3 });
+      hls.loadSource(src);
+      hls.attachMedia(video);
+    }
+  });
+</script>
+</body>
+</html>
+EOF
+}
+
+# Keeps one stream alive forever: if Xvfb, Chrome or FFmpeg dies, all three restart.
+run_stream() {
+  local n=$1 url=$2
+  local display=$((DISPLAY_BASE + n))
+  local out=$HLS_ROOT/page$n
+  local profile=$DATA_DIR/chrome-$n
+  local gop=$((FPS * HLS_TIME))
+
+  while true; do
+    rm -rf "$out" "/tmp/.X${display}-lock" "/tmp/.X11-unix/X${display}" "$profile"/Singleton*
+    mkdir -p "$out" "$profile"
+
+    Xvfb ":$display" -screen 0 "${WIDTH}x${HEIGHT}x24" -nolisten tcp -ac &
+    for _ in $(seq 50); do
+      xdpyinfo -display ":$display" >/dev/null 2>&1 && break
+      sleep 0.2
+    done
+
+    DISPLAY=":$display" google-chrome \
+      --no-sandbox --test-type --disable-dev-shm-usage --disable-gpu \
+      --no-first-run --no-default-browser-check --noerrdialogs \
+      --disable-infobars --disable-session-crashed-bubble --disable-features=Translate \
+      --password-store=basic --check-for-update-interval=31536000 \
+      --autoplay-policy=no-user-gesture-required --mute-audio --hide-scrollbars \
+      --kiosk --window-position=0,0 --window-size="${WIDTH},${HEIGHT}" \
+      --user-data-dir="$profile" "$url" &
+
+    sleep "$PAGE_LOAD_WAIT"
+
+    # Silent audio track: many players reject or stall on video-only HLS.
+    ffmpeg -hide_banner -loglevel warning -nostdin \
+      -f x11grab -draw_mouse 0 -video_size "${WIDTH}x${HEIGHT}" -framerate "$FPS" -i ":$display" \
+      -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+      -c:v libx264 -preset "$PRESET" -tune zerolatency -pix_fmt yuv420p \
+      -b:v "${BITRATE}k" -maxrate "${BITRATE}k" -bufsize "$((BITRATE * 2))k" \
+      -g "$gop" -keyint_min "$gop" -sc_threshold 0 \
+      -c:a aac -b:a 64k \
+      -f hls -hls_time "$HLS_TIME" -hls_list_size "$HLS_LIST_SIZE" \
+      -hls_flags delete_segments+independent_segments \
+      -hls_segment_filename "$out/seg_%05d.ts" "$out/index.m3u8" &
+
+    wait -n || true
+    log "page$n: a process exited, restarting in 5s"
+    kill $(jobs -p) 2>/dev/null || true
+    wait || true
+    sleep 5
+  done
+}
+
+start_streams() {
+  mkdir -p "$RUN_DIR" "$LOG_DIR" "$DATA_DIR"
+  local n=0 url
+  while IFS= read -r url; do
+    n=$((n + 1))
+    # setsid gives each stream its own process group, so stop can kill it whole.
+    setsid "$SELF" _run "$n" "$url" > "$LOG_DIR/page$n.log" 2>&1 < /dev/null &
+    echo $! > "$RUN_DIR/page$n.pid"
+    log "page$n started: $url"
+  done < <(stream_urls)
+}
+
+stop_streams() {
+  local pidfile pid
+  for pidfile in "$RUN_DIR"/page*.pid; do
+    [[ -f $pidfile ]] || continue
+    pid=$(cat "$pidfile")
+    kill -TERM -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    rm -f "$pidfile"
+  done
+  # Catch strays from a crashed or interrupted run.
+  pkill -f "$SELF _run" 2>/dev/null || true
+  pkill -f "x11grab" 2>/dev/null || true
+  pkill -f "user-data-dir=$DATA_DIR/chrome-" 2>/dev/null || true
+  pkill -x Xvfb 2>/dev/null || true
+  sleep 1
+}
+
+print_urls() {
+  local base n=0 url
+  base=$(public_base)
+  echo
+  echo "Stream links:"
+  while IFS= read -r url; do
+    n=$((n + 1))
+    echo "  page$n  $base/page$n/index.m3u8   ($url)"
+  done < <(stream_urls)
+  echo
+  echo "Preview player: $base/"
+  [[ -z $POD_ID ]] && echo "(RUNPOD_POD_ID not set - replace localhost with https://<POD_ID>-${PORT}.proxy.runpod.net)"
+  return 0
+}
+
+print_status() {
+  local n=0 url pidfile playlist state age
+  while IFS= read -r url; do
+    n=$((n + 1))
+    pidfile=$RUN_DIR/page$n.pid
+    playlist=$HLS_ROOT/page$n/index.m3u8
+    if [[ -f $pidfile ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+      if [[ -f $playlist ]]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$playlist") ))
+        if (( age <= HLS_TIME * 3 )); then state="LIVE"; else state="STALLED (playlist ${age}s old)"; fi
+      else
+        state="STARTING"
+      fi
+    else
+      state="STOPPED"
+    fi
+    echo "page$n  $state  $url"
+  done < <(stream_urls)
+  if [[ -f $RUN_DIR/nginx.pid ]] && kill -0 "$(cat "$RUN_DIR/nginx.pid")" 2>/dev/null; then
+    echo "nginx  running on port $PORT"
+  else
+    echo "nginx  STOPPED"
+  fi
+  echo "logs:  $LOG_DIR/"
+}
+
+start_all() {
+  [[ -n $STREAM_URLS ]] || die "STREAM_URLS is empty. Example: STREAM_URLS=\"https://a.com,https://b.com\" bash deploy.sh"
+  stop_streams
+  write_nginx_conf
+  write_index
+  start_nginx
+  start_streams
+  log "Waiting for the first segments..."
+  sleep $((PAGE_LOAD_WAIT + HLS_TIME * 3))
+  print_status
+  print_urls
+}
+
+usage() {
+  sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local cmd=${1:-deploy}
+  [[ $cmd == "help" || $cmd == "-h" || $cmd == "--help" ]] && { usage; exit 0; }
+  [[ $EUID -eq 0 ]] || die "run as root"
+  load_config
+
+  case $cmd in
+    deploy)
+      install_self
+      install_deps
+      save_config
+      start_all
+      ;;
+    start|restart)
+      save_config
+      start_all
+      ;;
+    stop)
+      stop_streams
+      stop_nginx
+      log "All streams stopped"
+      ;;
+    status) print_status ;;
+    urls) print_urls ;;
+    _run) shift; run_stream "$@" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
